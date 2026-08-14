@@ -8,64 +8,241 @@ jobs:
     runs-on: windows-2022
 
     steps:
+      # ---------------------------------------------------------
+      # 1. Получаем исходники nDPI
+      # ---------------------------------------------------------
       - name: Checkout nDPI
         uses: actions/checkout@v4
 
+      # ---------------------------------------------------------
+      # 2. Устанавливаем MSBuild
+      # ---------------------------------------------------------
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      # ---------------------------------------------------------
+      # 3. Устанавливаем NuGet
+      # ---------------------------------------------------------
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      # ---------------------------------------------------------
+      # 4. Устанавливаем Npcap
+      #
+      # Npcap нужен для Windows-сборки nDPI.
+      # Он устанавливается ТОЛЬКО на временный GitHub runner.
+      # На твоём Windows после этого ничего устанавливать не надо.
+      # ---------------------------------------------------------
+      - name: Download Npcap
+        shell: powershell
+        run: |
+          $url = "https://npcap.com/dist/npcap-1.88.exe"
+          $installer = "$env:TEMP\npcap.exe"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
+
+          Write-Host "Npcap downloaded:"
+          Get-Item $installer
+
+      - name: Install Npcap
+        shell: powershell
+        run: |
+          $installer = "$env:TEMP\npcap.exe"
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/loopback_support=yes /winpcap_mode=yes /quiet" `
+            -Wait `
+            -PassThru
+
+          Write-Host "Npcap installation finished."
+
+      # ---------------------------------------------------------
+      # 5. Restore NuGet dependencies
+      # ---------------------------------------------------------
       - name: Restore NuGet packages
-        run: nuget restore windows\nDPI.sln
+        shell: powershell
+        run: |
+          nuget restore windows\nDPI.sln
 
+      # ---------------------------------------------------------
+      # 6. Build ndpiReader
+      # ---------------------------------------------------------
       - name: Build ndpiReader
-        run: >
-          msbuild windows\nDPI.sln
-          /m
-          /p:Configuration=Debug-ndpiReader
-          /p:Platform=x64
+        shell: powershell
+        run: |
+          msbuild windows\nDPI.sln `
+            /m `
+            /p:Configuration=Debug-ndpiReader `
+            /p:Platform=x64
 
+      # ---------------------------------------------------------
+      # 7. Создаём portable-папку
+      # ---------------------------------------------------------
       - name: Prepare portable package
         shell: powershell
         run: |
           $out = "ndpiReader-win-x64"
 
-          New-Item -ItemType Directory -Force $out | Out-Null
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $out | Out-Null
 
-          Copy-Item `
-            "windows\bin\x64_Debug-ndpiReader\ndpiReader.exe" `
-            "$out\ndpiReader.exe"
+          # -----------------------------------------------------
+          # ndpiReader.exe
+          # -----------------------------------------------------
+          $exe = "windows\bin\x64_Debug-ndpiReader\ndpiReader.exe"
 
-          Copy-Item `
-            "windows\WpdPack\Lib\x64\wpcap.dll" `
-            "$out\wpcap.dll" `
-            -ErrorAction SilentlyContinue
-
-          if (Test-Path "windows\WpdPack\Lib\x64\Packet.dll") {
-            Copy-Item `
-              "windows\WpdPack\Lib\x64\Packet.dll" `
-              "$out\Packet.dll"
-          }
-
-          Write-Host "=== PACKAGE CONTENT ==="
-          Get-ChildItem $out
-
-      - name: Check executable
-        shell: powershell
-        run: |
-          if (!(Test-Path "ndpiReader-win-x64\ndpiReader.exe")) {
-            Write-Error "ndpiReader.exe was not created"
+          if (!(Test-Path $exe)) {
+            Write-Error "ndpiReader.exe was not found: $exe"
             exit 1
           }
 
+          Copy-Item `
+            $exe `
+            "$out\ndpiReader.exe"
+
+          # -----------------------------------------------------
+          # Ищем Npcap runtime DLL
+          # -----------------------------------------------------
+          $npcapDir = "C:\Windows\System32\Npcap"
+
+          $dlls = @(
+            "wpcap.dll",
+            "Packet.dll"
+          )
+
+          foreach ($dll in $dlls) {
+
+            $source = Join-Path $npcapDir $dll
+
+            if (Test-Path $source) {
+
+              Write-Host "Copying $source"
+
+              Copy-Item `
+                $source `
+                "$out\$dll" `
+                -Force
+
+            } else {
+
+              Write-Warning "$dll was not found at $source"
+
+            }
+          }
+
+          # -----------------------------------------------------
+          # pthread runtime
+          # -----------------------------------------------------
+          $pthreadCandidates = @(
+            "windows\bin\x64_Debug-ndpiReader",
+            "windows\packages",
+            "C:\Program Files"
+          )
+
+          foreach ($base in $pthreadCandidates) {
+
+            if (Test-Path $base) {
+
+              Get-ChildItem `
+                -Path $base `
+                -Filter "pthread*.dll" `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                ForEach-Object {
+
+                  Write-Host "Found pthread DLL: $($_.FullName)"
+
+                  Copy-Item `
+                    $_.FullName `
+                    "$out\$($_.Name)" `
+                    -Force
+                }
+            }
+          }
+
+          # -----------------------------------------------------
+          # Печатаем содержимое
+          # -----------------------------------------------------
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "PORTABLE PACKAGE CONTENT"
+          Write-Host "========================================"
+
+          Get-ChildItem $out |
+            Select-Object Name, Length
+
+      # ---------------------------------------------------------
+      # 8. Проверяем, что exe существует
+      # ---------------------------------------------------------
+      - name: Check executable
+        shell: powershell
+        run: |
+          $exe = "ndpiReader-win-x64\ndpiReader.exe"
+
+          if (!(Test-Path $exe)) {
+
+            Write-Error "ndpiReader.exe was not created."
+
+            exit 1
+          }
+
+          Write-Host "ndpiReader.exe OK"
+
+      # ---------------------------------------------------------
+      # 9. Проверяем DLL
+      # ---------------------------------------------------------
+      - name: Check runtime DLLs
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "RUNTIME DLLS"
+          Write-Host "========================================"
+
+          $dlls = Get-ChildItem `
+            "ndpiReader-win-x64\*.dll" `
+            -ErrorAction SilentlyContinue
+
+          if ($dlls.Count -eq 0) {
+
+            Write-Error "NO RUNTIME DLLS FOUND."
+
+            exit 1
+          }
+
+          $dlls |
+            Select-Object Name, Length
+
+      # ---------------------------------------------------------
+      # 10. Создаём ZIP
+      # ---------------------------------------------------------
       - name: Create ZIP
         shell: powershell
         run: |
+          if (Test-Path "ndpiReader-win-x64.zip") {
+            Remove-Item "ndpiReader-win-x64.zip" -Force
+          }
+
           Compress-Archive `
             -Path "ndpiReader-win-x64" `
-            -DestinationPath "ndpiReader-win-x64.zip"
+            -DestinationPath "ndpiReader-win-x64.zip" `
+            -CompressionLevel Optimal
 
-      - name: Upload artifact
+          Write-Host ""
+          Write-Host "ZIP CREATED:"
+          Get-Item "ndpiReader-win-x64.zip"
+
+      # ---------------------------------------------------------
+      # 11. Загружаем ZIP как GitHub Artifact
+      # ---------------------------------------------------------
+      - name: Upload portable ZIP
         uses: actions/upload-artifact@v4
         with:
           name: ndpiReader-win-x64
           path: ndpiReader-win-x64.zip
+          if-no-files-found: error
