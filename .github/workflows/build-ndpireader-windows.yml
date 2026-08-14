@@ -1,0 +1,71 @@
+name: Build ndpiReader Windows x64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout nDPI
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore windows\nDPI.sln
+
+      - name: Build ndpiReader
+        run: >
+          msbuild windows\nDPI.sln
+          /m
+          /p:Configuration=Debug-ndpiReader
+          /p:Platform=x64
+
+      - name: Prepare portable package
+        shell: powershell
+        run: |
+          $out = "ndpiReader-win-x64"
+
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          Copy-Item `
+            "windows\bin\x64_Debug-ndpiReader\ndpiReader.exe" `
+            "$out\ndpiReader.exe"
+
+          Copy-Item `
+            "windows\WpdPack\Lib\x64\wpcap.dll" `
+            "$out\wpcap.dll" `
+            -ErrorAction SilentlyContinue
+
+          if (Test-Path "windows\WpdPack\Lib\x64\Packet.dll") {
+            Copy-Item `
+              "windows\WpdPack\Lib\x64\Packet.dll" `
+              "$out\Packet.dll"
+          }
+
+          Write-Host "=== PACKAGE CONTENT ==="
+          Get-ChildItem $out
+
+      - name: Check executable
+        shell: powershell
+        run: |
+          if (!(Test-Path "ndpiReader-win-x64\ndpiReader.exe")) {
+            Write-Error "ndpiReader.exe was not created"
+            exit 1
+          }
+
+      - name: Create ZIP
+        shell: powershell
+        run: |
+          Compress-Archive `
+            -Path "ndpiReader-win-x64" `
+            -DestinationPath "ndpiReader-win-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndpiReader-win-x64
+          path: ndpiReader-win-x64.zip
